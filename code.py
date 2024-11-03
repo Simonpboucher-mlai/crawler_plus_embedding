@@ -3,7 +3,6 @@
 import os
 import re
 import requests
-import urllib.request
 import time
 import io
 import logging
@@ -13,12 +12,12 @@ import random
 import json
 import unicodedata
 import string
+import threading
 from collections import deque
 from html.parser import HTMLParser
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin
 
 from bs4 import BeautifulSoup
-from PyPDF2 import PdfReader
 from fake_useragent import UserAgent
 
 import pandas as pd
@@ -28,9 +27,19 @@ from tqdm import tqdm
 import tiktoken
 import openai
 
+# Import pdfplumber for PDF text extraction
+import pdfplumber
+
+# ===========================
+# Configuration and Settings
+# ===========================
+
 # Configure logging
-logging.basicConfig(filename='crawler_log.txt', level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    filename='crawler_log.txt',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+)
 
 # Regex pattern to match a URL
 HTTP_URL_PATTERN = r'^http[s]*://.+'
@@ -42,20 +51,40 @@ full_url = "https://www.ouellet.com/fr-ca/"
 # User-Agent configuration
 ua = UserAgent()
 
+# Maximum retries for requests
+MAX_RETRIES = 3
+
+# Delay between retries in seconds
+RETRY_DELAY = 5
+
+# Maximum number of worker threads
+MAX_WORKERS = 10
+
+# Random sleep time between requests to prevent overloading server
+SLEEP_TIME = (1, 3)  # Min and max seconds
+
+
+# ======================================
+# Crawler and Text Extraction Functions
+# ======================================
+
 class HyperlinkParser(HTMLParser):
+    """HTML parser to extract hyperlinks."""
     def __init__(self):
         super().__init__()
         self.hyperlinks = []
-    
+
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         if tag == "a" and "href" in attrs:
             self.hyperlinks.append(attrs["href"])
 
-def get_hyperlinks(url):
+
+def get_hyperlinks(url, session):
+    """Fetches hyperlinks from a given URL using the provided session."""
     try:
         headers = {'User-Agent': ua.random}
-        with requests.get(url, timeout=30, headers=headers) as response:
+        with session.get(url, timeout=30, headers=headers, allow_redirects=True) as response:
             response.raise_for_status()
             if not response.headers.get('Content-Type', '').startswith("text/html"):
                 return []
@@ -63,14 +92,16 @@ def get_hyperlinks(url):
     except requests.RequestException as e:
         logging.error(f"Error fetching {url}: {e}")
         return []
-    
+
     parser = HyperlinkParser()
     parser.feed(html)
     return parser.hyperlinks
 
-def get_domain_hyperlinks(local_domain, url):
+
+def get_domain_hyperlinks(local_domain, url, session):
+    """Filters and cleans hyperlinks to keep only those within the same domain."""
     clean_links = []
-    for link in set(get_hyperlinks(url)):
+    for link in set(get_hyperlinks(url, session)):
         clean_link = None
         if re.search(HTTP_URL_PATTERN, link):
             url_obj = urlparse(link)
@@ -80,85 +111,114 @@ def get_domain_hyperlinks(local_domain, url):
                 continue  # Ignore external links
         else:
             if link.startswith("/"):
-                link = link[1:]
+                clean_link = urljoin(f"https://{local_domain}", link)
             elif link.startswith("#") or link.startswith("mailto:"):
                 continue
-            clean_link = f"https://{local_domain}/{link}"
-        
+            else:
+                clean_link = urljoin(url, link)
+
         if clean_link:
-            if clean_link.endswith("/"):
-                clean_link = clean_link[:-1]
-                
-            # Ignore unwanted URLs
-            if ("postulez-en-ligne" not in clean_link and 
+            clean_link = clean_link.rstrip('/')
+
+            # Include PDFs and other documents
+            if ("postulez-en-ligne" not in clean_link and
                 not re.search(r'\.(jpg|jpeg|png|gif|css|js)$', clean_link, re.IGNORECASE)):
                 clean_links.append(clean_link)
-    
+
     return list(set(clean_links))
 
+
 def sanitize_filename(filename, max_length=200):
+    """Sanitize and truncate filenames to prevent filesystem errors."""
+    filename = unquote(filename)
     filename = unicodedata.normalize('NFKD', filename).encode('ASCII', 'ignore').decode('ASCII')
     valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
-    filename = ''.join(c for c in filename if c in valid_chars)
-    filename = filename.rstrip('.')
-    
-    if len(filename) > max_length:
-        name, ext = os.path.splitext(filename)
-        hash_str = hashlib.md5(filename.encode()).hexdigest()[:8]
-        filename = f"{name[:max_length - len(ext) - 9]}_{hash_str}{ext}"
-    
-    return filename
+    sanitized = ''.join(c for c in filename if c in valid_chars)
+    sanitized = sanitized.rstrip('.')
+
+    if len(sanitized) > max_length:
+        name, ext = os.path.splitext(sanitized)
+        hash_str = hashlib.md5(sanitized.encode()).hexdigest()[:8]
+        sanitized = f"{name[:max_length - len(ext) - 9]}_{hash_str}{ext}"
+
+    return sanitized or 'unnamed'
+
 
 def extract_text_from_pdf(pdf_content):
+    """Extracts text from PDF content, including tables."""
+    text = ""
     try:
-        pdf_reader = PdfReader(io.BytesIO(pdf_content))
-        text = ""
-        for page in pdf_reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-        return text
+        with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+
+                # Extract tables
+                tables = page.extract_tables()
+                for table in tables:
+                    # Convert table to string
+                    table_text = '\n'.join(['\t'.join(map(str, row)) for row in table])
+                    text += table_text + "\n"
     except Exception as e:
         logging.error(f"Error extracting content from PDF: {e}")
-        return ""
+    return text
+
 
 def clean_text(text):
+    """Cleans up text by removing excessive whitespace."""
     text = re.sub(r'\s+', ' ', text)
     text = text.strip()
     return text
 
+
 def extract_text_from_html(html_content):
+    """Extracts meaningful text from HTML content."""
     soup = BeautifulSoup(html_content, "html.parser")
     for script in soup(["script", "style"]):
         script.decompose()
-    
-    text = ""
-    for element in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li']):
-        text += element.get_text() + "\n"
-    
+
+    text = "\n".join(element.get_text() for element in soup.find_all(
+        ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li']))
     return clean_text(text)
 
+
 def extract_text_alternative(html_content):
+    """Alternative method to extract text from HTML if the main method fails."""
     soup = BeautifulSoup(html_content, "html.parser")
     return soup.get_text(separator=' ', strip=True)
 
-def normalize_url(url):
-    parsed = urlparse(url)
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
-def process_url(url, local_domain):
+def normalize_url(url):
+    """Normalizes URLs to a standard format."""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+
+
+def process_url(url, local_domain, session):
+    """Processes a single URL: fetches content and extracts text."""
     try:
         headers = {'User-Agent': ua.random}
-        response = requests.get(url, timeout=30, allow_redirects=True, headers=headers)
-        final_url = response.url
-        
-        if response.status_code == 404:
-            logging.warning(f"Page not found: {url}")
+        retries = 0
+        while retries < MAX_RETRIES:
+            try:
+                response = session.get(url, timeout=30, headers=headers, allow_redirects=True)
+                if response.status_code == 404:
+                    logging.warning(f"Page not found: {url}")
+                    return None
+                response.raise_for_status()
+                break
+            except requests.RequestException as e:
+                retries += 1
+                logging.warning(f"Retry {retries}/{MAX_RETRIES} for {url} due to {e}")
+                time.sleep(RETRY_DELAY)
+        else:
+            logging.error(f"Max retries exceeded for {url}")
             return None
-        
-        response.raise_for_status()
-        
+
+        final_url = response.url
         content_type = response.headers.get('Content-Type', '').lower()
+
         if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
             pdf_text = extract_text_from_pdf(response.content)
             if pdf_text.strip():
@@ -175,194 +235,214 @@ def process_url(url, local_domain):
                 logging.warning(f"Empty HTML content: {final_url}")
         else:
             logging.warning(f"Unsupported content type: {content_type} at {final_url}")
-        
+
         return None
-    
+
     except requests.RequestException as e:
         logging.error(f"Error processing {url}: {e}")
         return None
 
-def crawl(url):
-    local_domain = urlparse(url).netloc
-    queue = deque([url])
+
+def crawl(start_url):
+    """Main function to manage crawling of the domain starting from start_url."""
+    local_domain = urlparse(start_url).netloc
+    queue = deque([start_url])
     seen = set()
-    
-    if not os.path.exists("text/"):
-        os.mkdir("text/")
-    
-    if not os.path.exists(f"text/{local_domain}/"):
-        os.mkdir(f"text/{local_domain}/")
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        while queue:
-            urls_to_process = []
-            for _ in range(min(5, len(queue))):
+
+    output_dir = os.path.join("text", local_domain)
+    os.makedirs(output_dir, exist_ok=True)
+
+    session = requests.Session()
+
+    def worker():
+        while True:
+            url = None
+            with queue_lock:
                 if queue:
-                    urls_to_process.append(queue.pop())
-            
-            future_to_url = {executor.submit(process_url, url, local_domain): url for url in urls_to_process}
-            
-            for future in concurrent.futures.as_completed(future_to_url):
-                url = future_to_url[future]
-                normalized_url = normalize_url(url)
-                if normalized_url in seen:
-                    continue
-                seen.add(normalized_url)
-                
-                result = future.result()
-                if result:
-                    content_type, final_url, content = result
-                    print(f"Processed: {final_url}")  # Display the URL
-                    
-                    filename = sanitize_filename(unquote(final_url[8:]).replace("/", "_"))
-                    filepath = f'text/{local_domain}/{filename}.txt'
-                    with open(filepath, "w", encoding='utf-8') as f:
-                        f.write(content)
-                    logging.info(f"{content_type.upper()} extracted: {final_url}")
-                    
-                    if content_type == 'html':
-                        for link in get_domain_hyperlinks(local_domain, final_url):
-                            if normalize_url(link) not in seen:
+                    url = queue.popleft()
+                else:
+                    break
+
+            normalized_url = normalize_url(url)
+            if normalized_url in seen:
+                continue
+            seen.add(normalized_url)
+
+            result = process_url(url, local_domain, session)
+            if result:
+                content_type, final_url, content = result
+                print(f"Processed: {final_url}")
+
+                filename = sanitize_filename(final_url[8:].replace("/", "_"))
+                filepath = os.path.join(output_dir, f"{filename}.txt")
+                with open(filepath, "w", encoding='utf-8') as f:
+                    f.write(content)
+                logging.info(f"{content_type.upper()} extracted: {final_url}")
+
+                if content_type == 'html':
+                    links = get_domain_hyperlinks(local_domain, final_url, session)
+                    with queue_lock:
+                        for link in links:
+                            norm_link = normalize_url(link)
+                            if norm_link not in seen:
                                 queue.append(link)
-                
-            time.sleep(random.uniform(1, 3))  # Random pause between 1 and 3 seconds
-                        
+
+            time.sleep(random.uniform(*SLEEP_TIME))  # Pause between requests
+
+    queue_lock = threading.Lock()
+    threads = []
+    for _ in range(MAX_WORKERS):
+        t = threading.Thread(target=worker)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    session.close()
     print(f"Crawling and text extraction completed for domain {local_domain}.")
 
-# Run the crawler
-crawl(full_url)
 
-# Embeddings part
+# =======================
+# Embedding Functions
+# =======================
 
 # Configure your OpenAI API key
 openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
     raise ValueError("No OpenAI API key found. Please set OPENAI_API_KEY environment variable.")
 
-# Function to split text into chunks
+# Maximum tokens per chunk
+MAX_TOKENS = 8191  # For 'text-embedding-ada-002'
+
+# Tokenizer
+tokenizer = tiktoken.get_encoding("cl100k_base")
+
+
 def split_into_chunks(text, max_tokens):
-    tokenizer = tiktoken.get_encoding("cl100k_base")
-    
-    # Extract the first two lines as header
+    """Splits text into chunks within the max_tokens limit."""
+    # Extract header if any
     lines = text.split('\n')
-    header = '\n'.join(lines[:2]) + '\n'
-    
+    header_lines = []
+    for line in lines:
+        if line.strip() == '':
+            break
+        header_lines.append(line)
+    header = '\n'.join(header_lines) + '\n'
+
     # Remaining text
-    remaining_text = '\n'.join(lines[2:])
-    
+    remaining_text = '\n'.join(lines[len(header_lines):])
+
     # Encode remaining text
     tokens = tokenizer.encode(remaining_text)
-    
+    header_tokens = tokenizer.encode(header)
+    header_token_count = len(header_tokens)
+
     chunks = []
-    for i in range(0, len(tokens), max_tokens):
-        chunk_tokens = tokenizer.encode(header) + tokens[i:i + max_tokens]
+    max_content_tokens = max_tokens - header_token_count
+    for i in range(0, len(tokens), max_content_tokens):
+        chunk_tokens = header_tokens + tokens[i:i + max_content_tokens]
         chunk = tokenizer.decode(chunk_tokens)
         chunks.append(chunk)
-    
+
     return chunks
 
-# Function to get the embedding of text
+
 def get_embedding(text):
+    """Gets the embedding vector for the given text."""
     try:
         response = openai.Embedding.create(
             input=[text],
-            model="text-embedding-ada-002"  # Adjust model as needed
+            model="text-embedding-ada-002"
         )
         return response['data'][0]['embedding']
     except Exception as e:
-        print(f"Error getting embedding: {e}")
+        logging.error(f"Error getting embedding: {e}")
         return None
 
-# Folder containing .txt files
-folder_path = os.path.join("text", domain)
 
-# List of chunk sizes to process
-chunk_sizes = [400, 800, 1200]
+def process_files_for_embedding(folder_path, chunk_size):
+    """Processes text files to generate embeddings."""
+    all_results = []
 
-# Dictionary to store all results
-all_results = {size: [] for size in chunk_sizes}
+    files = [f for f in os.listdir(folder_path) if f.endswith('.txt')]
+    for filename in tqdm(files, desc=f"Processing files with chunk size {chunk_size}"):
+        file_path = os.path.join(folder_path, filename)
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
 
-try:
-    # Iterate over all .txt files in the folder
-    for filename in tqdm(os.listdir(folder_path)):
-        if filename.endswith(".txt"):
-            file_path = os.path.join(folder_path, filename)
-            
-            print(f"Processing file: {filename}")
-            
-            # Read the content of the file
-            with open(file_path, 'r', encoding='utf-8') as file:
-                content = file.read()
-            
-            print(f"Content size: {len(content)} characters")
-            
-            # Clean the text
-            cleaned_content = clean_text(content)
-            
-            # Process for each chunk size
-            for chunk_size in chunk_sizes:
-                print(f"Processing for chunk size: {chunk_size}")
-                
-                # Split content into chunks
-                chunks = split_into_chunks(cleaned_content, chunk_size)
-                
-                print(f"Number of chunks: {len(chunks)}")
-                
-                # Get embedding for each chunk
-                for i, chunk in enumerate(chunks):
-                    print(f"Processing chunk {i+1}/{len(chunks)}")
-                    embedding = get_embedding(chunk)
-                    if embedding:
-                        all_results[chunk_size].append({
-                            'filename': filename,
-                            'chunk_id': i,
-                            'text': chunk,
-                            'embedding': embedding
-                        })
-                    else:
-                        print(f"Failed to obtain embedding for chunk {i+1} of file {filename}")
-    
-    # Create output directories and save results
-    for chunk_size in chunk_sizes:
-        df = pd.DataFrame(all_results[chunk_size])
-        output_file = f'embeddings_results_{chunk_size}tok.csv'
-        df.to_csv(output_file, index=False)
-        print(f"Results for {chunk_size} tokens saved in {output_file}")
-        
-        # Create folder for this chunk size if it doesn't exist
-        folder_name = f"{chunk_size}tok"
-        if not os.path.exists(folder_name):
-            os.makedirs(folder_name)
-        
-        # Prepare data for chunks.json
-        chunks_list = []
-        for index, row in df.iterrows():
-            chunk_data = {
-                "text": row['text'],
-                "embedding": row['embedding'],  # Stored as list
-                "metadata": {
-                    "filename": row['filename'],
-                    "chunk_id": row['chunk_id']
-                }
+        cleaned_content = clean_text(content)
+        chunks = split_into_chunks(cleaned_content, chunk_size)
+
+        for i, chunk in enumerate(chunks):
+            embedding = get_embedding(chunk)
+            if embedding:
+                all_results.append({
+                    'filename': filename,
+                    'chunk_id': i,
+                    'text': chunk,
+                    'embedding': embedding
+                })
+            else:
+                logging.warning(f"Failed to get embedding for chunk {i} in file {filename}")
+
+    return all_results
+
+
+def save_embeddings(all_results, chunk_size):
+    """Saves embeddings and chunks to files."""
+    df = pd.DataFrame(all_results)
+    output_dir = f"{chunk_size}tok"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save embeddings dataframe
+    csv_file = os.path.join(output_dir, 'embeddings.csv')
+    df.to_csv(csv_file, index=False)
+    print(f"Embeddings saved to {csv_file}")
+
+    # Prepare data for chunks.json
+    chunks_list = []
+    for _, row in df.iterrows():
+        chunk_data = {
+            "text": row['text'],
+            "embedding": row['embedding'],  # Stored as list
+            "metadata": {
+                "filename": row['filename'],
+                "chunk_id": row['chunk_id']
             }
-            chunks_list.append(chunk_data)
-        
-        # Write chunks.json
-        with open(os.path.join(folder_name, 'chunks.json'), 'w', encoding='utf-8') as f:
-            json.dump(chunks_list, f, ensure_ascii=False, indent=2)
-        
-        # Prepare embeddings for embeddings.npy
-        embeddings_list = [row['embedding'] for _, row in df.iterrows()]
-        embeddings_array = np.array(embeddings_list)
-        
-        # Save embeddings.npy
-        np.save(os.path.join(folder_name, 'embeddings.npy'), embeddings_array)
-        
-        print(f"Files chunks.json and embeddings.npy created successfully for {chunk_size} tokens.")
-    
-    print(f"Embeddings completed.")
+        }
+        chunks_list.append(chunk_data)
+
+    # Write chunks.json
+    json_file = os.path.join(output_dir, 'chunks.json')
+    with open(json_file, 'w', encoding='utf-8') as f:
+        json.dump(chunks_list, f, ensure_ascii=False, indent=2)
+    print(f"Chunks data saved to {json_file}")
+
+    # Save embeddings.npy
+    embeddings_array = np.array(df['embedding'].tolist())
+    npy_file = os.path.join(output_dir, 'embeddings.npy')
+    np.save(npy_file, embeddings_array)
+    print(f"Embeddings array saved to {npy_file}")
+
+
+# =======================
+# Main Execution
+# =======================
+
+if __name__ == '__main__':
+    # Start crawling
+    crawl(full_url)
+
+    # Folder containing .txt files
+    folder_path = os.path.join("text", domain)
+
+    # List of chunk sizes to process
+    chunk_sizes = [1000]  # Adjusted to match token limit of the embedding model
+
+    # Process files and generate embeddings for each chunk size
     for chunk_size in chunk_sizes:
-        print(f"Total chunks processed for {chunk_size} tokens: {len(all_results[chunk_size])}")
-    
-except Exception as e:
-    print(f"An error occurred: {e}")
+        all_results = process_files_for_embedding(folder_path, chunk_size)
+        save_embeddings(all_results, chunk_size)
+
+    print("All embeddings processed and saved successfully.")
