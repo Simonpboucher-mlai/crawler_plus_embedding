@@ -63,6 +63,8 @@ MAX_WORKERS = 10
 # Random sleep time between requests to prevent overloading server
 SLEEP_TIME = (1, 3)  # Min and max seconds
 
+# Chunk sizes configuration (nombre de tokens par chunk)
+CHUNK_SIZES = [1000]  # Vous pouvez ajouter d'autres tailles si nécessaire
 
 # ======================================
 # Crawler and Text Extraction Functions
@@ -263,6 +265,9 @@ def crawl(start_url):
                 else:
                     break
 
+            if url is None:
+                continue
+
             normalized_url = normalize_url(url)
             if normalized_url in seen:
                 continue
@@ -434,14 +439,11 @@ if __name__ == '__main__':
     # Start crawling
     crawl(full_url)
 
-    # Folder containing .txt files
+    # Folder contenant les fichiers .txt
     folder_path = os.path.join("text", domain)
 
-    # List of chunk sizes to process
-    chunk_sizes = [1000]  # Adjusted to match token limit of the embedding model
-
-    # Process files and generate embeddings for each chunk size
-    for chunk_size in chunk_sizes:
+    # Utiliser les tailles de chunk définies dans la configuration
+    for chunk_size in CHUNK_SIZES:
         all_results = process_files_for_embedding(folder_path, chunk_size)
         save_embeddings(all_results, chunk_size)
 
